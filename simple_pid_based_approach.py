@@ -16,21 +16,16 @@ class SimplePID:
         self.prev_error = 0.0
         self.integral = 0.0
         self.last_time = time.time()
-
     def update(self, error):
         current_time = time.time()
         dt = current_time - self.last_time
         if dt <= 0: return 0
-
-        # Proportional
-        p_term = self.kp * error
-
-        # Integral (with anti-windup)
-        self.integral += error * dt
+        p_term = self.kp * error  # Proportional
+        
+        self.integral += error * dt  # Integral (with anti-windup)
         i_term = self.ki * self.integral
 
-        # Derivative
-        derivative = (error - self.prev_error) / dt
+        derivative = (error - self.prev_error) / dt   # Derivative
         d_term = self.kd * derivative
 
         # Calculate output
