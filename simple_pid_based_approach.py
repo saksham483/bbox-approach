@@ -2,181 +2,193 @@
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float32MultiArray  # Assuming [x, y, w, h] format
+from std_msgs.msg import Float32MultiArray, Bool
 from custom_msgs.msg import Commands
 import time
 
 class SimplePID:
-    def __init__(self, kp, ki, kd, min_out=-400, max_out=400):
+    def __init__(self, kp, ki, kd, min_out=-400, max_out=400, deadband=0.0):
         self.kp = kp
         self.ki = ki
         self.kd = kd
         self.min_out = min_out
         self.max_out = max_out
+        self.deadband = deadband
         self.prev_error = 0.0
         self.integral = 0.0
         self.last_time = time.time()
+
     def update(self, error):
+        if abs(error) < self.deadband:
+            return 0.0
+
         current_time = time.time()
         dt = current_time - self.last_time
         if dt <= 0: return 0
-        p_term = self.kp * error  # Proportional
-        
-        self.integral += error * dt  # Integral (with anti-windup)
-        i_term = self.ki * self.integral
 
-        derivative = (error - self.prev_error) / dt   # Derivative
+        p_term = self.kp * error
+        self.integral += error * dt
+        self.integral = max(-100, min(100, self.integral)) # Anti-windup
+        i_term = self.ki * self.integral
+        derivative = (error - self.prev_error) / dt
         d_term = self.kd * derivative
 
-        # Calculate output
         output = p_term + i_term + d_term
-        
-        # Clamp output
-        output = max(self.min_out, min(self.max_out, output))
-
         self.prev_error = error
         self.last_time = current_time
-        return output
+        return max(self.min_out, min(self.max_out, output))
 
     def reset(self):
         self.prev_error = 0.0
         self.integral = 0.0
         self.last_time = time.time()
 
-class VisualServoNode(Node):
+class Phase1ApproachNode(Node):
     def __init__(self):
-        super().__init__('visual_servo_controller')
+        super().__init__('phase1_front_cam_controller')
 
         # --- Parameters ---
         self.declare_parameter('image_width', 640)
         self.declare_parameter('image_height', 480)
-        self.declare_parameter('target_box_width', 150.0) # Desired width in pixels (controls distance)
         
-        # PID Gains (TUNE THESE CAREFULLY IN WATER)
-        # Format: [Kp, Ki, Kd]
-        self.pid_yaw_gains = [2.0, 0.0, 0.5]   # Controls Heading
-        self.pid_heave_gains = [2.0, 0.0, 0.5] # Controls Depth
-        self.pid_surge_gains = [1.5, 0.0, 0.2] # Controls Forward/Back
+        # TARGET Y: We want the box center to be at roughly 75% down the image.
+        # This ensures the AUV is physically ABOVE the platform.
+        # 480 * 0.75 = 360.
+        self.target_y_pos = 360.0 
+        
+        # --- PID Config ---
+        # Yaw: Keeps us pointing at it
+        self.pid_yaw = SimplePID(1.5, 0.0, 0.3, deadband=10.0)
+        
+        # Heave: Maintains altitude relative to platform
+        # If box is too high in image (y=200), we are too deep. Go UP.
+        self.pid_heave = SimplePID(2.0, 0.01, 0.5, deadband=15.0)
+        
+        # Surge: Approach logic
+        self.pid_surge = SimplePID(1.2, 0.0, 0.1, max_out=250, deadband=0.0)
 
-        # --- State Variables ---
+        # --- State ---
         self.img_w = self.get_parameter('image_width').value
         self.img_h = self.get_parameter('image_height').value
-        self.target_w = self.get_parameter('target_box_width').value
-        
         self.center_x = self.img_w / 2.0
-        self.center_y = self.img_h / 2.0
         
-        # Safety: Last time we saw a box. If > 1.0s, stop vehicle.
-        self.last_detection_time = time.time()
-        
-        # --- Controllers ---
-        # Outputs are offsets from 1500 (e.g., -400 to +400)
-        self.pid_yaw = SimplePID(*self.pid_yaw_gains)
-        self.pid_heave = SimplePID(*self.pid_heave_gains)
-        self.pid_surge = SimplePID(*self.pid_surge_gains)
+        self.last_front_detection = 0
+        self.phase_2_triggered = False
 
-        # --- Publishers & Subscribers ---
-        # Subscribe to bounding box (Change message type if needed)
+        # Moving Average Filter
+        self.alpha = 0.7 
+        self.filt_cx = self.center_x
+        self.filt_cy = self.target_y_pos
+        self.filt_w = 0.0
+
+        # --- Subscribers ---
+        # 1. Front Camera YOLO Bounding Box
         self.bbox_sub = self.create_subscription(
-            Float32MultiArray, 
-            '/perception/bbox', 
-            self.bbox_callback, 
-            10
-        )
-
-        # Publish commands to your PixhawkMaster script
+            Float32MultiArray, '/perception/front/bbox', self.front_bbox_callback, 10)
+        
+        # 2. Bottom Camera ArUco Detection (The "Switch")
+        self.aruco_sub = self.create_subscription(
+            Bool, '/perception/bottom/aruco_found', self.bottom_aruco_callback, 10)
+        
+        # --- Publishers ---
         self.cmd_pub = self.create_publisher(Commands, '/master/commands', 10)
+        self.timer = self.create_timer(0.05, self.control_loop) # 20Hz
 
-        # Timer to publish commands at fixed rate (20Hz)
-        self.timer = self.create_timer(0.05, self.control_loop)
-        
-        # Shared variable to store latest visual error
-        self.latest_bbox = None
-        
-        self.get_logger().info("Visual Servo Node Started. Waiting for BBox...")
+        self.get_logger().info("Phase 1 (Front Cam) Started. Ready for Fly-Over.")
 
-    def bbox_callback(self, msg):
-        # Assuming msg.data is [x, y, w, h]
-        # x, y is usually top-left corner. We need the CENTER.
-        if len(msg.data) < 4:
-            return
+    def bottom_aruco_callback(self, msg):
+        # THIS IS THE CRITICAL HANDOFF
+        if msg.data is True:
+            if not self.phase_2_triggered:
+                self.get_logger().warn("BOTTOM CAM SEES ARUCO! KILLING PHASE 1.")
+                self.phase_2_triggered = True
 
+    def front_bbox_callback(self, msg):
+        if len(msg.data) < 4: return
         x, y, w, h = msg.data
         
-        # Convert top-left to center
-        box_center_x = x + (w / 2.0)
-        box_center_y = y + (h / 2.0)
+        raw_cx = x + (w / 2.0)
+        raw_cy = y + (h / 2.0)
+
+        # Filter the inputs
+        self.filt_cx = (self.alpha * raw_cx) + ((1 - self.alpha) * self.filt_cx)
+        self.filt_cy = (self.alpha * raw_cy) + ((1 - self.alpha) * self.filt_cy)
+        self.filt_w = (self.alpha * w) + ((1 - self.alpha) * self.filt_w)
         
-        self.latest_bbox = {
-            'cx': box_center_x,
-            'cy': box_center_y,
-            'w': w,
-            'h': h
-        }
-        self.last_detection_time = time.time()
+        self.last_front_detection = time.time()
 
     def control_loop(self):
-        cmd_msg = Commands()
-        cmd_msg.arm = 1 # Keep armed while tracking
-        cmd_msg.mode = "STABILIZE" # or DEPTH_HOLD
-        
-        # Default PWMs (Neutral)
-        base_pwm = 1500
-        cmd_msg.pitch = base_pwm
-        cmd_msg.roll = base_pwm
-        cmd_msg.thrust = base_pwm
-        cmd_msg.yaw = base_pwm
-        cmd_msg.forward = base_pwm
-        cmd_msg.lateral = base_pwm
-        cmd_msg.servo1 = base_pwm
-        cmd_msg.servo2 = base_pwm
-
-        # Safety Check: Object Lost?
-        if (time.time() - self.last_detection_time) > 1.0 or self.latest_bbox is None:
-            # STOP EVERYTHING
-            self.get_logger().warn("Target lost - Hovering", throttle_duration_sec=2)
-            # We publish the neutral commands set above
-            self.cmd_pub.publish(cmd_msg)
-            
-            # Reset PIDs to prevent "windup jump" when object reappears
-            self.pid_yaw.reset()
-            self.pid_heave.reset()
-            self.pid_surge.reset()
+        # --- HANDOFF CHECK ---
+        if self.phase_2_triggered:
+            # Phase 2 node should be running now. We stop publishing or publish zeros.
+            # Best practice: Publish nothing and let Phase 2 take over the topic.
             return
 
-        # --- 1. YAW CONTROL (Steering) ---
-        # Error: Distance from image center X
-        # If object is right (cx > center), error is positive.
-        # Need to turn Right.
-        err_x = self.latest_bbox['cx'] - self.center_x
+        cmd_msg = Commands()
+        cmd_msg.arm = 1
+        cmd_msg.mode = "STABILIZE"
+        base = 1500
+        cmd_msg.pitch = base
+        cmd_msg.roll = base
+        cmd_msg.yaw = base
+        cmd_msg.thrust = base
+        cmd_msg.forward = base
+        cmd_msg.lateral = base
+
+        # --- LOST TARGET LOGIC (Blind Spot Handling) ---
+        time_since_detection = time.time() - self.last_front_detection
+        
+        if time_since_detection > 0.5:
+            if time_since_detection < 3.0:
+                # CASE: We just lost it. It probably went under us.
+                # ACTION: Keep moving forward blindly to help it reach the bottom cam.
+                self.get_logger().info("Target went under? Pushing forward...", throttle_duration_sec=1)
+                cmd_msg.forward = 1600 # Gentle forward nudge
+                cmd_msg.yaw = base     # Keep heading steady
+                cmd_msg.thrust = base  # Maintain depth
+                self.cmd_pub.publish(cmd_msg)
+                return
+            else:
+                # CASE: Lost for too long. Search mode.
+                self.get_logger().warn("Target Lost completely. Hovering.")
+                self.cmd_pub.publish(cmd_msg) # Stop
+                return
+
+        # --- CONTROL LAW ---
+
+        # 1. YAW: Center Horizontally
+        err_x = self.filt_cx - self.center_x
         yaw_effort = self.pid_yaw.update(err_x)
-        cmd_msg.yaw = int(base_pwm + yaw_effort)
+        cmd_msg.yaw = int(base + yaw_effort)
 
-        # --- 2. HEAVE CONTROL (Depth) ---
-        # Error: Distance from image center Y
-        # If object is down (cy > center), error is positive.
-        # Need to go Down.
-        # NOTE: In ROVs, usually PWM < 1500 is DOWN, > 1500 is UP.
-        # If error is positive (object lower), we want PWM < 1500.
-        err_y = self.latest_bbox['cy'] - self.center_y
+        # 2. HEAVE: Offset Vertically (Fly Over)
+        # Target: 360 (Lower part of screen). Current: filt_cy.
+        # If Current is 200 (Top of screen), Error = 360 - 200 = +160.
+        # Positive Error means we are too DEEP (relative to where we want the box).
+        # We need to go UP.
+        # Standard Config: Up = PWM > 1500.
+        err_y = self.target_y_pos - self.filt_cy
         heave_effort = self.pid_heave.update(err_y)
-        cmd_msg.thrust = int(base_pwm - heave_effort) # Note the minus sign for standard config
+        cmd_msg.thrust = int(base + heave_effort) 
 
-        # --- 3. SURGE CONTROL (Distance) ---
-        # Error: Difference in width (How close are we?)
-        # Target w = 150. Current w = 100. Error = 50.
-        # We need to go forward (Positive Surge).
-        err_size = self.target_w - self.latest_bbox['w']
+        # 3. SURGE: Move Forward based on Width
+        # Target width could be roughly screen width (meaning we are right on top of it)
+        target_w = self.img_w * 0.8 # Stop accelerating when it fills 80% of screen
+        err_size = target_w - self.filt_w
         surge_effort = self.pid_surge.update(err_size)
-        cmd_msg.forward = int(base_pwm + surge_effort)
+        
+        # Ensure we always have some forward momentum if we see it
+        final_forward = base + surge_effort
+        # Clamp to reasonable speed
+        final_forward = max(1400, min(1600, final_forward))
+        
+        cmd_msg.forward = int(final_forward)
 
-        # Publish
         self.cmd_pub.publish(cmd_msg)
-        # self.get_logger().info(f"Y:{cmd_msg.yaw} H:{cmd_msg.thrust} F:{cmd_msg.forward}")
 
 def main(args=None):
     rclpy.init(args=args)
-    node = VisualServoNode()
+    node = Phase1ApproachNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
