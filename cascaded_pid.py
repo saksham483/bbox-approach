@@ -56,16 +56,13 @@ class CascadedVisualServo(Node):
         self.declare_parameter('image_height', 480)
         self.declare_parameter('target_area', 15000.0) # Target box area (prox for distance)
 
-        # --- 1. OUTER LOOP TUNING (Vision -> Velocity) ---
-        # "If box is 100px off, how fast (0-1.0 scale) should I turn?"
-        
+        # --- 1. OUTER LOOP TUNING (Vision -> Velocity) --
         # Yaw: Output is normalized rotational rate (-1.0 to 1.0)
         # Kp=0.005 means: 100px error -> 0.5 (50% max turning speed)
         self.pid_yaw = PIDController(kp=0.005, ki=0.0, kd=0.0005, max_output=0.8)
         
         # Heave: Output is normalized vertical speed (-1.0 to 1.0)
         self.pid_heave = PIDController(kp=0.005, ki=0.0, kd=0.0005, max_output=0.8)
-        
         # Surge: Output is normalized forward speed (-1.0 to 1.0)
         # Input is Area Error. Areas are big numbers, so Kp is tiny.
         self.pid_surge = PIDController(kp=0.0001, ki=0.0, kd=0.00005, max_output=0.5)
@@ -100,15 +97,9 @@ class CascadedVisualServo(Node):
         self.last_detection_time = time.time()
 
     def map_velocity_to_pwm(self, velocity_normalized, channel_name):
-        """
-        Maps a normalized velocity (-1.0 to 1.0) to Pixhawk PWM (1100-1900).
-        1500 is stop.
-        """
-        # Deadzone handling (optional but good for thrusters)
+        # Deadzone handling
         if abs(velocity_normalized) < 0.05:
             return 1500
-
-        # Pixhawk expects 1100 to 1900. Range is +/- 400.
         # We invert logic here if needed. 
         # Usually: 1900 = Turn Right / Go Up / Go Forward
         
@@ -122,7 +113,6 @@ class CascadedVisualServo(Node):
         # In STABILIZE: 
         # Yaw PWM 1900 = Rotate Right at Max Rate defined in ArduSub
         # Thrust PWM 1900 = Ascend at Max Speed
-
         # Safety Check
         if (time.time() - self.last_detection_time) > 1.0 or self.latest_bbox is None:
             self.pid_yaw.reset()
@@ -150,18 +140,15 @@ class CascadedVisualServo(Node):
         # Note: Check directions!
         # If err_yaw is positive (object is right), we want vel_yaw > 0 (Turn Right)
         cmd.yaw = self.map_velocity_to_pwm(vel_yaw, 'yaw')
-        
         # If err_heave is positive (object is down), we want to go DOWN.
         # Standard ROV: 1100 is down. So we invert the velocity.
         cmd.thrust = self.map_velocity_to_pwm(-vel_heave, 'heave') 
-
         # If err_surge is positive (target area > current area), we want to go FORWARD.
         cmd.forward = self.map_velocity_to_pwm(vel_surge, 'surge')
-
         # Fill rest
         cmd.pitch = 1500
         cmd.roll = 1500
-        cmd.lateral = 1500 # Use lateral if you want to strafe instead of yaw
+        cmd.lateral = 1500
         cmd.servo1 = 1500
         cmd.servo2 = 1500
 
